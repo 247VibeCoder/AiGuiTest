@@ -1,0 +1,147 @@
+#!/usr/bin/env python3
+"""Test run: executes a scenario or a step file against the VNC.
+
+    ./start.sh aiguitest-run --selftest                    # without VNC/model
+    ./start.sh aiguitest-run                               # built-in scenario
+    ./start.sh aiguitest-run scripts/test1.yaml            # run a step file
+    ./start.sh aiguitest-run --steps scripts/test1.yaml    # same thing
+    ./start.sh aiguitest-run test1                         # bare name: scripts/
+    ./start.sh aiguitest-run scripts/test1.yaml --nollm    # clicks on stored
+                                                           # points, asserts with model
+    ./start.sh aiguitest-run --replay runs/2026...         # without model, by template
+
+Every run logs to runs/<timestamp>/: a screenshot per step, needle crops
+and run.json. '--replay' runs from that folder. The console output also
+goes to log/<timestamp>_<name>.log.
+"""
+
+import argparse
+import os
+import sys
+import time
+import traceback
+
+from aiguitest import (PASSWORD, SERVER, WORKSPACE, Run, VncSession, Vlm,
+                       load_steps, replay, run_log, run_steps, scenario,
+                       script_path, selftest)
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--server", default=None,
+                   help="beats the 'vnc' entry of the step file")
+    p.add_argument("--outdir", default=None)
+    p.add_argument("--replay", metavar="RUNDIR")
+    p.add_argument("--steps", metavar="STEPS_YAML",
+                   help="run a step file from aiguitest-workbench")
+    # The same file may also just stand there on its own - that's the
+    # spelling people try first.
+    p.add_argument("steps_file", nargs="?", metavar="STEPS_YAML",
+                   help="same as --steps; a bare name like 'openTerminal' "
+                        "comes from scripts/")
+    p.add_argument("--nollm", action="store_true",
+                   help="clicks on the stored points instead of via the "
+                        "model; asserts still ask the model")
+    p.add_argument("--selftest", action="store_true")
+    args = p.parse_args()
+
+    if args.selftest:
+        selftest()
+        return 0
+
+    steps_path = args.steps or args.steps_file
+    # As 'use' in the workbench: 'openTerminal' means scripts/openTerminal.yaml.
+    # An existing file wins, so that 'steps.yaml' in the project stays put.
+    if steps_path and not os.path.isfile(steps_path):
+        steps_path = script_path(steps_path)
+    if args.replay:
+        name = "replay_" + os.path.basename(os.path.normpath(args.replay))
+    elif steps_path:
+        name = os.path.splitext(os.path.basename(steps_path))[0]
+    else:
+        name = "scenario"
+    with run_log(name) as log:
+        try:
+            return _main(args, steps_path)
+        except SystemExit as e:
+            # load_steps reports via SystemExit - that belongs in the log too
+            if not isinstance(e.code, str):
+                raise
+            print(e.code, file=sys.stderr)
+            return 2
+        except Exception:
+            # Otherwise Python prints the traceback only after the log ends
+            traceback.print_exc()
+            return 1
+        finally:
+            print("Log: %s" % os.path.relpath(log.path))
+
+
+def _main(args, steps_path):
+    if args.nollm and not steps_path:
+        print("--nollm needs a step file", file=sys.stderr)
+        return 2
+
+    # The step file may bring the connection along. Order:
+    # command line beats file beats environment/default.
+    data, steps = ({}, None)
+    if steps_path and not os.path.isfile(steps_path):
+        print("No step file: %s" % steps_path, file=sys.stderr)
+        return 2
+    if steps_path:
+        data, steps = load_steps(steps_path)
+    vnc = data.get("vnc") or {}
+    server = args.server or vnc.get("server") or SERVER
+    password = vnc.get("password") or PASSWORD
+    if data.get("name"):
+        print("Test: %s" % data["name"])
+    print("VNC: %s" % server)
+    # stdout is block-buffered when redirected, stderr isn't: without a flush
+    # an error message lands in the log before the lines preceding it.
+    sys.stdout.flush()
+
+    try:
+        session = VncSession(server, password)
+    except Exception as e:
+        # Most common cases: wrong or missing password, server unreachable.
+        # A bare traceback helps nobody there.
+        print("No VNC connection to %s\n  %s: %s"
+              % (server, type(e).__name__, e), file=sys.stderr)
+        print("  Check 'vnc' (server/password) in the step file, --server "
+              "or VNC_SERVER/VNC_PASSWORD.", file=sys.stderr)
+        return 2
+
+    try:
+        if args.replay:
+            replay(args.replay, session)
+            return 0
+
+        outdir = args.outdir or os.path.join(
+            WORKSPACE, time.strftime("runs/%Y%m%d-%H%M%S"))
+        vlm = Vlm()
+        run = Run(session, vlm, outdir)
+        try:
+            if steps is not None:
+                run_steps(run, steps, points=args.nollm, inside=(steps_path,))
+            else:
+                scenario(run)
+            print("\nPassed. %d model calls, %.1f s model time."
+                  % (vlm.calls, vlm.seconds))
+            return 0
+        except Exception as e:
+            # Save an image even on an unexpected error - otherwise you're
+            # left alone with the message.
+            kind = "" if isinstance(e, AssertionError) else "%s: " % type(e).__name__
+            print("\nFAILED: %s%s" % (kind, e), file=sys.stderr)
+            path = run.error_screenshot()
+            if path:
+                print("Screenshot of the error: %s" % path, file=sys.stderr)
+            return 1
+        finally:
+            print("Run log: %s" % run.save())
+    finally:
+        session.close()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

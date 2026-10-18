@@ -1,0 +1,816 @@
+#!/usr/bin/env python3
+"""Prompt workbench for the semantic GUI test.
+
+Interactive shell against a running VNC (or against a PNG) in which you try
+out prompts, measure their stability and export the useful ones as steps.
+'aiguitest-run --steps' then runs the exported file.
+
+    ./start.sh aiguitest-workbench                        # against VNC
+    ./start.sh aiguitest-workbench --image screen.png     # offline
+    ./start.sh aiguitest-workbench --fake --image x.png   # without a model
+
+Commands - those marked 'AI' go through the model, the rest run locally:
+    AIsee [question]         free description of the screen
+    AIask <question>         yes/no judgement, measures stability over 'n'
+    AIfind <description>     bounding box straight from the model (unreliable)
+    find <image.png>         search an image by template, without a model; a
+                             bare name comes from images/
+    find <img> --score <s>   own threshold instead of 0.9, goes into the step
+    AImarks <description>    numbered candidates, the model picks a number
+    AImarks <d> --needle <p>    sieve by template first: 60 become ~2
+    pick <n>                 pick a candidate by hand, without a model
+    click [x y]              click the last hit or fixed coordinates
+    mouse x y                only move the mouse, e.g. 'mouse 0,0' away from
+                             the target so no hover changes the image
+    key <key>                key name: ctrl-alt-t, enter, space
+    type <text>              type text character by character
+    n <number>               repetitions per prompt
+    shot [path]              save a screenshot (local only, not a step;
+                             no extension -> .png, no directory -> tmp/)
+    log <text>               marker in the session log, e.g.
+                             log "ready for step 2"; becomes a step
+    history [n]              show the last n inputs (default 10, 'all')
+    drop [i]                 remove an input (default: the last one)
+    export [name]            write the steps to scripts/<name>.yaml
+                             (default steps; with a directory: exactly there)
+    use <name> [nollm|llm]   run scripts/<name>.yaml here, e.g. to bring
+                             the desktop into its initial state;
+                             'use <Tab>' lists the scripts. If every click
+                             step has a point, it clicks there (nollm),
+                             otherwise the model searches (llm); nollm/llm
+                             forces it. Asserts always ask the model.
+                             Becomes a step 'use': export writes the
+                             reference, not the steps. The recorded step
+                             carries 'mode: nollm' by default - generated
+                             scripts run without a model unless an
+                             explicit 'llm' was forced when 'use'd.
+
+The history records every input verbatim, except history/drop/export/help.
+Behind the lines that turn into a step for the file, 'history' shows it
+with '->': ask, key, type, mouse, log, a 'click' after find/marks, and a
+successful 'use'.
+
+The whole session including inputs is in log/<timestamp>_workbench.log.
+Whatever doesn't belong in the test, 'drop' takes out again.
+
+Example session:
+    > key ctrl-alt-t
+    > AI ask Is a terminal window open?
+    > AI marks the close button (X) of the Geany window --needle images/close.png
+    > click
+    > history
+    > export openTerminal              # -> scripts/openTerminal.yaml
+"""
+
+import argparse
+import atexit
+import os
+import re
+import statistics
+import sys
+
+import cv2
+
+from aiguitest import (FakeVlm, IMAGE_DIRS, IMAGE_EXT, ImageSource, PASSWORD,
+                       SCRIPT_DIRS, SCRIPT_EXT, SCRIPTS, SERVER, WORKSPACE,
+                       Run, Vlm, VncSession, _extract_json, candidate_boxes,
+                       draw_marks, image_path, load_steps, log_marker, match,
+                       needle_filter, run_log, run_steps, save_steps,
+                       script_path, tmp_path)
+
+ANNOT = tmp_path("vlm_annot.png")
+HISTORY = os.path.expanduser("~/.aiguitest_history")
+
+
+# --------------------------------------------------------------- History ---
+
+def _save_history(readline, path):
+    try:
+        readline.write_history_file(path)
+    except OSError as e:
+        print("history not saved: %s" % e)
+
+
+def _init_history(path=HISTORY):
+    """Keep the arrow-key history beyond the end of the session."""
+    try:
+        import readline            # not available on every platform
+    except ImportError:
+        print("  (no readline - no history, no arrow keys)")
+        return None
+    try:
+        readline.read_history_file(path)
+    except OSError:
+        pass                       # first session, no file yet
+    readline.set_history_length(1000)
+    # atexit instead of a finally block: also fires on Ctrl-D and Ctrl-C.
+    atexit.register(_save_history, readline, path)
+    return path
+
+
+def _scripts():
+    """Names of the step files in scripts/, as 'use' takes them.
+
+    All SCRIPT_DIRS are scanned - the workspace scripts/ first, then the
+    submodule copy if AiGuiTest lives next to the workspace. Duplicate
+    basenames are hidden so the same name does not get listed twice.
+    """
+    seen = set()
+    out = []
+    for d in SCRIPT_DIRS:
+        try:
+            names = os.listdir(d)
+        except OSError:
+            continue
+        for n in names:
+            if not n.lower().endswith(SCRIPT_EXT):
+                continue
+            base = os.path.splitext(n)[0]
+            if base in seen:
+                continue
+            seen.add(base)
+            out.append(base)
+    return sorted(out)
+
+
+def _images():
+    """Images across every IMAGE_DIRS, as bare names 'find' and '--needle'
+    take them. The workspace folder comes first - same overlap resolution
+    rule as the runner, so a file with the same name in both folders is
+    reported from where the user actually intends it.
+    """
+    seen = set()
+    out = []
+    for d in IMAGE_DIRS:
+        try:
+            names = os.listdir(d)
+        except OSError:
+            continue
+        for n in names:
+            if not n.lower().endswith(IMAGE_EXT):
+                continue
+            if n in seen:
+                continue
+            seen.add(n)
+            out.append(n)
+    return sorted(out)
+
+
+def _image_path(arg):
+    """'close.png' -> a real path the way the user wrote it; None if arg is
+    no image name. Quotes are dropped - find "close.png" means the file.
+    Bare names resolve through image_path() so a workspace that has no
+    images/ still finds them in AiGuiTest/images/ when the project is
+    consumed as a submodule.
+    """
+    name = arg.strip().strip("\"'")
+    if not name.lower().endswith(IMAGE_EXT) or " " in name:
+        return None
+    return image_path(name)
+
+
+def _script_ref(path):
+    """What a script is called in a 'use' step: bare if script_path finds it
+    again that way, otherwise relative to the workspace (start.sh cds there)."""
+    name = os.path.splitext(os.path.basename(path))[0]
+    if os.path.abspath(script_path(name)) == os.path.abspath(path):
+        return name
+    return os.path.relpath(path, WORKSPACE)
+
+
+def _clicks(steps, inside=()):
+    """All click/click_marks steps, also from scripts included via 'use' -
+    the run clicks there too. load_steps reports errors."""
+    out = []
+    for st in steps:
+        if st.get("type") in ("click", "click_marks"):
+            out.append(st)
+        elif st.get("type") == "use" and st.get("mode") != "llm":
+            # mode llm: the model searches there anyway, points don't matter
+            path = script_path(st["script"])
+            if path not in inside and os.path.isfile(path):
+                out += _clicks(load_steps(path)[1], inside + (path,))
+    return out
+
+
+def _all_points(steps):
+    """True if there are click steps and every one has a 'point'.
+
+    Without click steps False: then there's nothing to speed up, and the run
+    with the model remains the one that can fill in points.
+    """
+    clicks = _clicks(steps)
+    return bool(clicks) and all(st.get("point") for st in clicks)
+
+
+def _yaml_load(text):
+    import yaml                    # lazy as in runner._yaml
+    try:
+        return yaml.safe_load(text)
+    except yaml.YAMLError as e:
+        raise ValueError(str(e))
+
+
+def _completer(commands):
+    """Tab: commands at the start of the line, then script or image names."""
+    import readline
+
+    def complete(text, state):
+        buf = readline.get_line_buffer()
+        words = buf[:readline.get_begidx()].split()
+        if not words:
+            pool = [c + " " for c in commands]
+        elif words[0] in ("use", "export"):
+            pool = _scripts()      # fresh on every Tab: export creates some
+        elif words == ["find"] or words[-1] == "--needle":
+            pool = _images()
+        else:
+            pool = []
+        hits = [w for w in pool if w.startswith(text)]
+        return hits[state] if state < len(hits) else None
+    return complete
+
+
+def _init_completion(commands):
+    """Turn on Tab completion; without readline silently nothing."""
+    try:
+        import readline
+    except ImportError:
+        return
+    readline.set_completer(_completer(sorted(commands)))
+    # Split only at spaces: script names may contain '-' and '.'.
+    readline.set_completer_delims(" \t\n")
+    # macOS Python ships libedit instead of GNU readline, different syntax
+    if "libedit" in (readline.__doc__ or ""):
+        readline.parse_and_bind("bind ^I rl_complete")
+    else:
+        readline.parse_and_bind("tab: complete")
+
+
+# ------------------------------------------------------------------ Shell --
+
+class Workbench:
+    def __init__(self, src, vlm, reps=1, server=None):
+        self.src, self.vlm, self.reps = src, vlm, reps
+        self.server = server       # goes into the step file as 'vnc'
+        self.last_box = None
+        self.last_boxes = []       # candidates of the last 'marks', for 'pick'
+        self.log = None            # RunLog of the session, for the inputs
+        # Step that a 'click' on last_box writes into the history:
+        # set by find/marks, cleared by pick and failures
+        self.last_target = None
+        # Every input verbatim: {"cmd": line, "steps": [...]}. 'export'
+        # writes 'steps' from it; mostly empty or one.
+        self.history = []
+        self.exported = []         # state at the last 'export'
+
+    # Inputs that only operate the history itself and don't belong in it
+    META = ("history", "drop", "export", "help")
+
+    @property
+    def steps(self):
+        return [st for e in self.history for st in e["steps"]]
+
+    # --- output helpers ---
+    def _spread(self, boxes):
+        cx = [(b[0] + b[2]) / 2 for b in boxes]
+        cy = [(b[1] + b[3]) / 2 for b in boxes]
+        if len(boxes) < 2:
+            return 0.0
+        return max(statistics.pstdev(cx), statistics.pstdev(cy))
+
+    # --- commands ---
+    def cmd_AIsee(self, arg):
+        question = arg or "Describe precisely which windows and controls are visible."
+        img = self.src.screenshot()
+        for i in range(self.reps):
+            print("  [%d] %s" % (i + 1, self.vlm.raw(img, question)))
+
+    def cmd_AIask(self, arg):
+        if not arg:
+            return print("  ask <question>")
+        img = self.src.screenshot()
+        res = [self.vlm.ask(img, arg) for _ in range(self.reps)]
+        for i, r in enumerate(res, 1):
+            print("  [%d] ok=%s | %s" % (i, r["ok"], r["seen"]))
+        oks = [r["ok"] for r in res]
+        print("  -> stability: %d/%d agree" % (oks.count(oks[0]), len(oks)))
+        step = {"type": "assert", "prompt": arg}
+        # The majority decides what the run expects - that way negative
+        # asserts ("window is gone") also make it into the file.
+        if oks.count(True) * 2 < len(oks):
+            step["expected"] = False
+        self._record(step)
+
+    def cmd_AIfind(self, arg):
+        if not arg:
+            return print("  AIfind <description>")
+        self.last_target = None
+        img = self.src.screenshot()
+        hits = [self.vlm.locate(img, arg) for _ in range(self.reps)]
+        good = [h["box"] for h in hits if h]
+        if not good:
+            return print("  not found (%d attempts)" % self.reps)
+        for i, b in enumerate(good, 1):
+            print("  [%d] box=%s centre=(%d,%d)" %
+                  (i, b, (b[0] + b[2]) // 2, (b[1] + b[3]) // 2))
+        if len(good) > 1:
+            print("  -> spread of the centre: %.1f px (%d/%d hits)"
+                  % (self._spread(good), len(good), self.reps))
+        self.last_box = good[-1]
+        cv2.imwrite(ANNOT, draw_marks(img, [(self.last_box[0], self.last_box[1],
+                                             self.last_box[2] - self.last_box[0],
+                                             self.last_box[3] - self.last_box[1])]))
+        print("  annotated: %s" % ANNOT)
+        self.last_target = {"type": "click", "prompt": arg}
+
+    def cmd_find(self, arg):
+        if not arg:
+            return print("  find <image.png>")
+        threshold = None
+        if "--score" in arg:
+            arg, _, rest = arg.partition("--score")
+            arg = arg.strip()
+            try:
+                threshold = float(rest.split()[0])
+            except (IndexError, ValueError):
+                threshold = -1
+            if not 0 < threshold <= 1:
+                return print("  --score <0..1>, e.g. 'find close.png --score 0.8'")
+        needle = _image_path(arg)
+        if not needle:
+            return print("  for a description use 'AIfind <description>'")
+        self.last_target = None
+        return self._find_needle(needle, threshold)
+
+    def _find_needle(self, path, threshold=None):
+        """find <image> - template search, same threshold as in the run.
+
+        An own threshold goes into the step, otherwise the run with 0.9
+        wouldn't click what the workbench found.
+        """
+        # isfile first: otherwise OpenCV adds a WARN line of its own
+        image = cv2.imread(path) if os.path.isfile(path) else None
+        if image is None:
+            return print("  image not readable: %s  ('find <Tab>' lists %s)"
+                         % (path,
+                            ", ".join(os.path.relpath(d) for d in IMAGE_DIRS)))
+        img = self.src.screenshot()
+        score, cx, cy = match(img, image)
+        h, w = image.shape[:2]
+        x, y = cx - w // 2, cy - h // 2
+        if score < (threshold or 0.9):
+            return print("  not found: %s (best score %.3f at (%d,%d), "
+                         "threshold %.2f - 'find %s --score <s>' lowers it)"
+                         % (path, score, cx, cy, threshold or 0.9,
+                            os.path.basename(path)))
+        self.last_box = [x, y, x + w, y + h]
+        cv2.imwrite(ANNOT, draw_marks(img, [(x, y, w, h)]))
+        print("  needle %s: score %.3f, box=%s centre=(%d,%d)"
+              % (path, score, self.last_box, cx, cy))
+        print("  annotated: %s" % ANNOT)
+        self.last_target = {"type": "click_needle", "needle": path}
+        if threshold:
+            self.last_target["threshold"] = threshold
+
+    def cmd_AImarks(self, arg):
+        """Set-of-marks: numbered candidates, the model only picks a number."""
+        target, needle = arg, None
+        if "--needle" in arg:
+            target, _, rest = arg.partition("--needle")
+            target, rest = target.strip(), rest.strip()
+            if not rest:
+                return print("  --needle <image>")
+            needle = _image_path(rest.split()[0]) or rest.split()[0]
+
+        self.last_target = None
+        img = self.src.screenshot()
+        boxes = candidate_boxes(img)
+        total = len(boxes)
+        extra = ""
+        if needle:
+            hits = needle_filter(img, boxes, needle)
+            if not hits:
+                return print("  no candidate matches %s" % needle)
+            boxes = [b for b, _ in hits]
+            extra = "  [needle %s: %d of %d, best score %.3f]" % (
+                needle, len(boxes), total, hits[0][1])
+
+        self.last_boxes = boxes    # so that 'pick n' can use them afterwards
+        vis = draw_marks(img, boxes)
+        cv2.imwrite(ANNOT, vis)
+        print("  %d candidates, annotated: %s  ('pick <n>' picks by hand)%s"
+              % (len(boxes), ANNOT, extra))
+        if not target:
+            return
+        question = ("Elements in the image are numbered in red. Which number "
+                    "is: %s\n"
+                    'Answer ONLY as {"number": <int>, "conf": 0.0}' % target)
+        try:
+            out = _extract_json(self.vlm.raw(vis, question))
+            n = int(out["number"])
+            x, y, w, h = boxes[n - 1]
+            self.last_box = [x, y, x + w, y + h]
+            print("  -> number %d, centre (%d,%d)" % (n, x + w // 2, y + h // 2))
+            self.last_target = {"type": "click_marks", "prompt": target}
+            if needle:
+                self.last_target["needle"] = needle
+        except Exception as e:
+            print("  evaluation failed: %s" % e)
+
+    def cmd_pick(self, arg):
+        """pick <n> - pick a candidate from the last 'marks' by hand.
+
+        You read the number off the annotated image. Only sets the target,
+        'click' does the clicking afterwards.
+        """
+        if not self.last_boxes:
+            return print("  run 'AImarks' first")
+        try:
+            n = int(arg.strip())
+        except ValueError:
+            return print("  pick <number>  (1..%d, from %s)"
+                         % (len(self.last_boxes), ANNOT))
+        if not 1 <= n <= len(self.last_boxes):
+            return print("  only numbers 1..%d exist" % len(self.last_boxes))
+        x, y, w, h = self.last_boxes[n - 1]
+        self.last_box = [x, y, x + w, y + h]
+        # The number only holds for this frame and there's no prompt - so the
+        # click can't be repeated as a step.
+        self.last_target = None
+        print("  #%d: box=(%d, %d, %d, %d) centre=(%d,%d) - 'click' clicks there"
+              % (n, x, y, w, h, x + w // 2, y + h // 2))
+
+    def cmd_click(self, arg):
+        if arg:
+            # '471 194', '471,194' and '(471,194)' - the latter is the format
+            # in which find/marks print the centre.
+            numbers = re.findall(r"-?\d+", arg)
+            if len(numbers) != 2:
+                return print("  click x y  (or 'click' for the last hit)")
+            x, y = int(numbers[0]), int(numbers[1])
+            step = None
+        elif self.last_box:
+            b = self.last_box
+            x, y = (b[0] + b[2]) // 2, (b[1] + b[3]) // 2
+            step = self.last_target
+            if step and step["type"] != "click_needle":
+                # for 'nollm': the fast run clicks exactly here.
+                # click_needle doesn't need it, the template works anyway.
+                step = dict(step, point=[x, y])
+        else:
+            return print("  no target - run find/marks first or 'click x y'")
+        print("  clicking (%d,%d)" % (x, y))
+        self.src.click(x, y)
+        if step:
+            self._record(dict(step))
+        else:
+            print("  (no step for the file: there is no find/marks prompt "
+                  "for this target)")
+
+    def cmd_mouse(self, arg):
+        """mouse x y - move the mouse without a click; becomes a step."""
+        # same spellings as with click: '0 0', '0,0', '(0,0)'
+        numbers = re.findall(r"-?\d+", arg)
+        if len(numbers) != 2:
+            return print("  mouse x y, e.g. 'mouse 0,0'")
+        x, y = int(numbers[0]), int(numbers[1])
+        self.src.move(x, y)
+        self._record({"type": "mouse", "point": [x, y]})
+
+    def cmd_key(self, arg):
+        from vncdotool.keys import KEYMAP   # lazy: offline mode stays free
+        k = arg.strip()
+        if not k:
+            return print("  key <key>, e.g. ctrl-alt-t, enter, space")
+        # vncdotool splits the name at '-' and calls ord() on every part.
+        # Unknown names would otherwise end in a bare TypeError.
+        parts = [k] if len(k) == 1 else k.split("-")
+        unknown = [p for p in parts if len(p) != 1 and p not in KEYMAP]
+        if unknown:
+            return print("  unknown key name: %s - to type text use "
+                         "'type %s'" % (", ".join(unknown), k))
+        self.src.key(k)
+        self._record({"type": "key", "key": k})
+
+    def cmd_type(self, arg):
+        self.src.type_text(arg)
+        self._record({"type": "type", "text": arg})
+
+    def cmd_log(self, arg):
+        """log <text> - marker that also shows up in the test run."""
+        # quotes are dropped: log "ready" means the text
+        text = arg.strip().strip("\"'").strip()
+        if not text:
+            return print('  log <text>, e.g. log "ready for step 2"')
+        print(log_marker(text))
+        self._record({"type": "log", "text": text})
+
+    def cmd_n(self, arg):
+        self.reps = max(1, int(arg))
+        print("  repetitions: %d" % self.reps)
+
+    def cmd_shot(self, arg):
+        path = arg.strip() or "vlm_shot"
+        # cv2 picks the format by extension and fails without one with an
+        # incomprehensible message. A bare name belongs in tmp/, not in the
+        # project directory.
+        if not os.path.splitext(path)[1]:
+            path += ".png"
+        if not os.path.dirname(path):
+            path = tmp_path(path)
+        try:
+            ok = cv2.imwrite(path, self.src.screenshot())
+        except cv2.error:
+            ok = False      # unknown extension, e.g. '.xyz'
+        if not ok:
+            return print("  not written: %s (directory exists? extension "
+                         ".png/.jpg?)" % path)
+        print("  saved: %s" % path)
+
+    def _record(self, step):
+        """Attach a step to the history input currently running."""
+        if not self.history:
+            return              # called outside run(), e.g. by hand
+        step = dict({"name": "step_%d" % len(self.steps)}, **step)
+        self.history[-1]["steps"].append(step)
+        print("  + #%d -> %s" % (len(self.history) - 1, self._describe(step)))
+
+    def _describe(self, s):
+        what = s.get("prompt") or s.get("key") or s.get("text") or s.get("script") or ""
+        if s["type"] == "click_needle":
+            what = s["needle"]
+            if s.get("threshold"):
+                what += "  [score >= %.2f]" % s["threshold"]
+        elif s.get("needle"):
+            what += "  [needle %s]" % s["needle"]
+        if s.get("mode"):
+            what += "  [%s]" % s["mode"]
+        if s.get("point"):
+            what += "  at (%d, %d)" % tuple(s["point"])
+        if s.get("expected") is False:
+            what += "  [expected: no]"
+        return "%-12s %s" % (s["type"], what)
+
+    def _line(self, e):
+        if not e["steps"]:
+            return e["cmd"]
+        if len(e["steps"]) > 1:
+            return "%-40s -> %d steps" % (e["cmd"], len(e["steps"]))
+        return "%-40s -> %s" % (e["cmd"], self._describe(e["steps"][0]))
+
+    def cmd_history(self, arg):
+        """history [n|all] - show the last n inputs."""
+        if not self.history:
+            return print("  history empty")
+        arg = arg.strip()
+        if arg == "all":
+            n = len(self.history)
+        else:
+            try:
+                n = int(arg) if arg else 10
+            except ValueError:
+                return print("  history [count|all]")
+        first = max(0, len(self.history) - n)
+        if first:
+            print("  ... %d older ('history all')" % first)
+        for i in range(first, len(self.history)):
+            print("  %2d %s" % (i, self._line(self.history[i])))
+
+    def cmd_drop(self, arg):
+        if not self.history:
+            return print("  history empty")
+        try:
+            i = int(arg) if arg else -1
+            e = self.history.pop(i)
+        except (ValueError, IndexError):
+            return print("  drop [number]  (0..%d, see 'history')"
+                         % (len(self.history) - 1))
+        print("  removed: %s" % self._line(e))
+
+    def cmd_use(self, arg):
+        """use <name> [nollm|llm] - step file in the running session."""
+        words = arg.split()
+        points = None              # None: decided by the points in the file
+        if words and words[-1] in ("nollm", "--nollm"):
+            points = True
+        elif words and words[-1] in ("llm", "--llm"):
+            points = False
+        if points is not None:
+            words.pop()
+        if not words:
+            return print("  use <name> [nollm|llm]  (from %s)"
+                         % ", ".join(os.path.relpath(d) for d in SCRIPT_DIRS))
+        path = script_path(" ".join(words))
+        if not os.path.exists(path):
+            return print("  no step file: %s" % path)
+        name = os.path.splitext(os.path.basename(path))[0]
+        self._use(path, name, points)
+
+    def _use(self, path, name, points):
+        # The log is a workbench by-product, not a result - so tmp/ instead
+        # of runs/, overwritten on every 'use' of the same script.
+        forced = points           # None if the file decides
+        run = Run(self.src, self.vlm, tmp_path("use_%s" % name))
+        self.last_target = None    # the screen is a different one afterwards
+        try:
+            # Only 'steps' counts: the workbench stays on its connection,
+            # a 'vnc' block in the file is not followed.
+            data, steps = load_steps(path)
+            other = (data.get("vnc") or {}).get("server")
+            if other and self.server and other != self.server:
+                print("  (file names %s, running against %s)"
+                      % (other, self.server))
+            if points is None:
+                points = _all_points(steps)
+                print("  mode: %s" % ("nollm (every click has a point)"
+                                      if points else
+                                      "llm (click without point - the model searches)"))
+            log = run_steps(run, steps, points=points, inside=(path,))
+        except (Exception, SystemExit) as e:
+            # load_steps and run_steps report via SystemExit - that must not
+            # reach the command loop, otherwise the session is gone.
+            print("  aborted: %s: %s" % (type(e).__name__, e))
+            shot = run.error_screenshot()
+            if shot:
+                print("  screen: %s" % shot)
+            return print("  (no step for the file)")
+        steps = [dict(st) for st in steps]
+        added = 0
+        for st, entry in zip(steps, log):
+            # Only fill in missing points: an existing one stays, otherwise
+            # it wanders a few pixels with every run and the versioned file
+            # keeps changing.
+            if (st["type"] in ("click", "click_marks") and not st.get("point")
+                    and entry.get("point")):
+                st["point"] = entry["point"]
+                added += 1
+        if added:
+            self._write_points(path, steps, added)
+        # One 'use' step instead of the included steps: if openTerminal
+        # changes, every script that uses it follows.
+        step = {"type": "use", "script": _script_ref(path)}
+        # Recorded steps carry their mode explicitly. 'nollm' is the
+        # default - generated scripts run without a model unless the user
+        # typed 'llm' at the workbench prompt. Click steps without a
+        # stored 'point' will then raise at run time; click each
+        # candidate at least once in the workbench so the point is
+        # stored, or pass --llm at replay time.
+        step["mode"] = "nollm" if forced is not False else "llm"
+        self._record(step)
+
+    def _write_points(self, path, steps, added):
+        """Write filled-in points into the script file, nothing else.
+
+        Only 'steps' is replaced; 'vnc', 'name' and everything else stay as
+        they are in the file.
+        """
+        rel = os.path.relpath(path, WORKSPACE)
+        try:
+            with open(path) as f:
+                text = f.read()
+            if path.lower().endswith(".json"):
+                return print("  (points only in the history: %s is still JSON "
+                             "- 'export' writes YAML)" % rel)
+            # PyYAML drops comments when writing back. Better to print the
+            # points than to delete the user's notes.
+            if re.search(r"(^|\s)#", text, re.M):
+                print("  (%s has comments, not rewritten - "
+                      "enter the points by hand:)" % rel)
+                for i, st in enumerate(steps):
+                    if st.get("point"):
+                        print("    step %d: point: [%d, %d]"
+                              % (i, st["point"][0], st["point"][1]))
+                return
+            data = _yaml_load(text)
+            if not isinstance(data.get("steps"), list) or \
+                    len(data["steps"]) != len(steps):
+                # old German file ('schritte') - don't rewrite
+                return print("  (points only in the history: %s has no "
+                             "English 'steps')" % rel)
+            for raw, st in zip(data["steps"], steps):
+                if st.get("point") and not raw.get("point"):
+                    raw["point"] = st["point"]
+            save_steps(path, data)
+        except (OSError, ValueError) as e:
+            return print("  points not saved: %s" % e)
+        print("  %d point(s) filled in in %s" % (added, rel))
+
+    def cmd_export(self, arg):
+        name = arg.strip() or "steps"
+        if name.lower().endswith(".json"):
+            return print("  step files are YAML: export %s.yaml"
+                         % name[:-5])
+        if not os.path.splitext(name)[1]:
+            name += ".yaml"        # never hit an existing .json
+        path = script_path(name)
+        data = {"steps": self.steps}
+        if self.server:
+            # Only the address, never the password: the file is versioned.
+            data = {"vnc": {"server": self.server}, "steps": self.steps}
+        try:
+            save_steps(path, data)
+        except OSError as e:
+            return print("  not written: %s" % e)
+        self.exported = self.steps
+        rel = os.path.relpath(path, WORKSPACE)
+        if rel.startswith(".."):
+            rel = path
+        print("  %d steps -> %s" % (len(self.steps), rel))
+        print("  run: ./start.sh aiguitest-run --steps %s" % rel)
+
+    def cmd_help(self, arg):
+        print(__doc__)
+
+    def commands(self):
+        return {k[4:]: getattr(self, k) for k in dir(self) if k.startswith("cmd_")}
+
+    def run(self, stream):
+        cmds = self.commands()
+        for line in stream:
+            line = line.strip()
+            if not line:
+                continue
+            if self.log:
+                # Otherwise the input itself only shows in the terminal - the
+                # log would hold the output without the command that caused it.
+                self.log.note("> " + line)
+            if line.startswith("#"):
+                continue
+            if line in ("quit", "exit", "q"):
+                break
+            head, _, rest = line.partition(" ")
+            fn = cmds.get(head)
+            if not fn:
+                print("  unknown: %s (help)" % head)
+                continue
+            if head not in self.META:
+                # before the call: an input that fails stays too -
+                # the history shows what was typed
+                self.history.append({"cmd": line, "steps": []})
+            try:
+                fn(rest.strip())
+            except Exception as e:
+                print("  error: %s: %s" % (type(e).__name__, e))
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--image", help="work against a PNG instead of VNC")
+    p.add_argument("--server", default=SERVER)
+    p.add_argument("--fake", action="store_true", help="without a model")
+    p.add_argument("-n", "--reps", type=int, default=1,
+                   help="repetitions per prompt (stability measurement)")
+    p.add_argument("--script", help="command file instead of interactive")
+    args = p.parse_args()
+
+    # One log per session, from connecting to 'q' - so a connection error
+    # is in it too.
+    with run_log("workbench") as log:
+        try:
+            return _main(args, log)
+        finally:
+            print("Log: %s" % os.path.relpath(log.path))
+
+
+def _main(args, log):
+    if args.image:
+        src = ImageSource(args.image)
+    else:
+        try:
+            src = VncSession(args.server, PASSWORD)
+        except Exception as e:
+            # As in aiguitest-run: plain text instead of a traceback, usually
+            # the desktop just isn't running or the password is wrong.
+            print("No VNC connection to %s\n  %s: %s"
+                  % (args.server, type(e).__name__, e), file=sys.stderr)
+            print("  Check --server or VNC_SERVER/VNC_PASSWORD; offline "
+                  "use --image image.png.", file=sys.stderr)
+            return 2
+    vlm = FakeVlm() if args.fake else Vlm()
+    wb = Workbench(src, vlm, args.reps, server=None if args.image else args.server)
+    wb.log = log
+
+    try:
+        if args.script:
+            with open(args.script) as f:
+                wb.run(f)
+        elif sys.stdin.isatty():
+            hist = _init_history()
+            _init_completion(wb.commands())
+            print("Prompt workbench. 'help' for commands, 'q' to quit.")
+            print("History: %s" % (hist or "off"))
+            wb.run(iter(lambda: input("> "), None))
+        else:
+            wb.run(sys.stdin)
+    except (EOFError, KeyboardInterrupt):
+        print()
+    finally:
+        src.close()
+        if wb.steps != wb.exported:
+            print("Steps not exported: %d ('export <name>')" % len(wb.steps))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

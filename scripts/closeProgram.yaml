@@ -1,0 +1,6 @@
+vnc:
+  server: 172.19.0.7::5901
+steps:
+  - type: click_needle
+    name: step_3
+    needle: images/close.png

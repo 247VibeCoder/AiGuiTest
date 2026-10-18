@@ -1,0 +1,11 @@
+.venv/
+tmp/
+log/
+__pycache__/
+config.json
+log/
+images/
+tmp/
+runs/
+.gitea/
+archiv/

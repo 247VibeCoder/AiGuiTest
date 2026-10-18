@@ -1,0 +1,9 @@
+{
+  "vnc": { "server": "172.19.0.10::5901", "password": "123456" },
+  "vlm": {
+    "base": "http://ctollama.home.arpa:11434/v1",
+    "model": "qwen3-vl:8b",
+    "key": "none",
+    "verify": true
+  }
+}

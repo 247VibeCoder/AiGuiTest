@@ -1,0 +1,22 @@
+{
+  "vnc": {
+    "server": "172.19.0.7::5901"
+  },
+  "steps": [
+    {
+      "name": "step_0",
+      "type": "click",
+      "prompt": "\"where is the applications button\""
+    },
+    {
+      "name": "step_2",
+      "type": "click",
+      "prompt": "\"where is the 'Terminal Emulator' button"
+    },
+    {
+      "name": "step_3",
+      "type": "assert",
+      "prompt": "\"ist der terminal geöffnet\""
+    }
+  ]
+}

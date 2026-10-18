@@ -1,0 +1,16 @@
+vnc:
+  server: 172.19.0.7::5901
+steps:
+  - type: click
+    name: step_0
+    prompt: "where is the applications button"
+    point: [60, 14]
+    mode: nollm
+  - type: click
+    name: step_1
+    prompt: "where is the 'Terminal Emulator' button"
+    point: [77, 71]
+    mode: nollm
+  - type: assert
+    name: step_2
+    prompt: "ist der terminal geöffnet"

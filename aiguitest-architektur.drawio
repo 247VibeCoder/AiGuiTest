@@ -1,0 +1,138 @@
+<mxfile host="65bd71144e">
+    <diagram id="aiguitest" name="aiguitest Architektur">
+        <mxGraphModel dx="1343" dy="606" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1600" pageHeight="900" math="0" shadow="0">
+            <root>
+                <mxCell id="0"/>
+                <mxCell id="1" parent="0"/>
+                <mxCell id="grpDev" value="devContainer" style="rounded=0;whiteSpace=wrap;html=1;dashed=1;dashPattern=8 8;fillColor=#fafafa;strokeColor=#666666;verticalAlign=top;fontStyle=1;fontSize=14;align=left;spacingLeft=10;" parent="1" vertex="1">
+                    <mxGeometry x="40" y="40" width="560" height="660" as="geometry"/>
+                </mxCell>
+                <mxCell id="py" value="Python Test&#xa;(pytest / steps.json)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" parent="1" vertex="1">
+                    <mxGeometry x="80" y="85" width="480" height="60" as="geometry"/>
+                </mxCell>
+                <mxCell id="apiBox" value="aiguitest-api" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;verticalAlign=top;fontStyle=1;fontSize=14;align=left;spacingLeft=10;opacity=50;" parent="1" vertex="1">
+                    <mxGeometry x="80" y="190" width="480" height="390" as="geometry"/>
+                </mxCell>
+                <mxCell id="2" style="edgeStyle=none;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="act" target="check">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="act" value="VNC-Aktion senden&#xa;(key / type / click)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#82b366;" parent="1" vertex="1">
+                    <mxGeometry x="110" y="245" width="190" height="60" as="geometry"/>
+                </mxCell>
+                <mxCell id="cap" value="Screenshot holen&#xa;+ Prompt bauen" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#82b366;" parent="1" vertex="1">
+                    <mxGeometry x="340" y="245" width="190" height="60" as="geometry"/>
+                </mxCell>
+                <mxCell id="check" value="check if open" style="rhombus;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;" parent="1" vertex="1">
+                    <mxGeometry x="230" y="360" width="180" height="100" as="geometry"/>
+                </mxCell>
+                <mxCell id="7" style="edgeStyle=none;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;" edge="1" parent="1" source="passed">
+                    <mxGeometry relative="1" as="geometry">
+                        <mxPoint x="320" y="630" as="targetPoint"/>
+                    </mxGeometry>
+                </mxCell>
+                <mxCell id="passed" value="return passed" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontStyle=1;" parent="1" vertex="1">
+                    <mxGeometry x="110" y="495" width="190" height="55" as="geometry"/>
+                </mxCell>
+                <mxCell id="8" style="edgeStyle=none;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;" edge="1" parent="1" source="failed">
+                    <mxGeometry relative="1" as="geometry">
+                        <mxPoint x="320" y="630" as="targetPoint"/>
+                    </mxGeometry>
+                </mxCell>
+                <mxCell id="failed" value="return failed&#xa;+ Screenshot" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontStyle=1;" parent="1" vertex="1">
+                    <mxGeometry x="340" y="495" width="190" height="55" as="geometry"/>
+                </mxCell>
+                <mxCell id="grpSut" value="Zielsystem (SUT)" style="rounded=0;whiteSpace=wrap;html=1;dashed=1;dashPattern=8 8;fillColor=#fafafa;strokeColor=#666666;verticalAlign=top;fontStyle=1;fontSize=14;align=left;spacingLeft=10;" parent="1" vertex="1">
+                    <mxGeometry x="720" y="40" width="320" height="280" as="geometry"/>
+                </mxCell>
+                <mxCell id="vnc" value="VNC-Server&#xa;(RFB, Port 5901)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;" parent="1" vertex="1">
+                    <mxGeometry x="750" y="90" width="260" height="60" as="geometry"/>
+                </mxCell>
+                <mxCell id="app" value="Anwendung&#xa;(open application)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;" parent="1" vertex="1">
+                    <mxGeometry x="750" y="210" width="260" height="60" as="geometry"/>
+                </mxCell>
+                <mxCell id="ollama" value="Ollama (CTollama)&#xa;qwen3-vl" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontStyle=1;" parent="1" vertex="1">
+                    <mxGeometry x="770" y="345" width="260" height="80" as="geometry"/>
+                </mxCell>
+                <mxCell id="e1" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=0.25;exitY=1;entryX=0.5;entryY=0;" parent="1" source="py" target="act" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e1l" value="Testschritte" style="edgeLabel;html=1;resizable=0;labelBackgroundColor=#ffffff;" parent="e1" vertex="1" connectable="0">
+                    <mxGeometry x="-0.2" relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e2" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" parent="1" edge="1">
+                    <mxGeometry relative="1" as="geometry">
+                        <Array as="points">
+                            <mxPoint x="320" y="285"/>
+                            <mxPoint x="320" y="220"/>
+                            <mxPoint x="660" y="220"/>
+                            <mxPoint x="660" y="130"/>
+                        </Array>
+                        <mxPoint x="300" y="285" as="sourcePoint"/>
+                        <mxPoint x="750" y="130" as="targetPoint"/>
+                    </mxGeometry>
+                </mxCell>
+                <mxCell id="e2l" value="RFB: keys, clicks" style="edgeLabel;html=1;resizable=0;labelBackgroundColor=#ffffff;" parent="e2" vertex="1" connectable="0">
+                    <mxGeometry x="0.3" relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e3" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" parent="1" source="vnc" target="app" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e3l" value="startet / rendert" style="edgeLabel;html=1;resizable=0;labelBackgroundColor=#ffffff;" parent="e3" vertex="1" connectable="0">
+                    <mxGeometry x="0.1" relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e4" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;dashed=1;exitX=0;exitY=0.5;entryX=1;entryY=0.5;" parent="1" source="app" target="cap" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e4l" value="Framebuffer" style="edgeLabel;html=1;resizable=0;labelBackgroundColor=#ffffff;" parent="e4" vertex="1" connectable="0">
+                    <mxGeometry x="0.2" relative="1" as="geometry">
+                        <mxPoint x="18" y="-35" as="offset"/>
+                    </mxGeometry>
+                </mxCell>
+                <mxCell id="e5" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=0.75;exitY=1;entryX=0;entryY=0.3;" parent="1" source="cap" target="ollama" edge="1">
+                    <mxGeometry relative="1" as="geometry">
+                        <Array as="points">
+                            <mxPoint x="483" y="370"/>
+                            <mxPoint x="670" y="370"/>
+                            <mxPoint x="670" y="369"/>
+                        </Array>
+                    </mxGeometry>
+                </mxCell>
+                <mxCell id="e5l" value="Screenshot + Prompt" style="edgeLabel;html=1;resizable=0;labelBackgroundColor=#ffffff;" parent="e5" vertex="1" connectable="0">
+                    <mxGeometry x="0.2" relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e6" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;dashed=1;exitX=0;exitY=0.75;entryX=1;entryY=0.5;" parent="1" source="ollama" target="check" edge="1">
+                    <mxGeometry relative="1" as="geometry">
+                        <Array as="points">
+                            <mxPoint x="770" y="400"/>
+                            <mxPoint x="620" y="400"/>
+                            <mxPoint x="620" y="410"/>
+                        </Array>
+                    </mxGeometry>
+                </mxCell>
+                <mxCell id="e6l" value="JSON: ok / box" style="edgeLabel;html=1;resizable=0;labelBackgroundColor=#ffffff;" parent="e6" vertex="1" connectable="0">
+                    <mxGeometry x="0.3" relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e7" value="ja" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=0;exitY=0.5;entryX=0.5;entryY=0;" parent="1" source="check" target="passed" edge="1">
+                    <mxGeometry relative="1" as="geometry">
+                        <Array as="points">
+                            <mxPoint x="205" y="410"/>
+                        </Array>
+                    </mxGeometry>
+                </mxCell>
+                <mxCell id="e8" value="nein" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=1;exitY=0.5;entryX=0.5;entryY=0;" parent="1" source="check" target="failed" edge="1">
+                    <mxGeometry relative="1" as="geometry">
+                        <Array as="points">
+                            <mxPoint x="435" y="410"/>
+                        </Array>
+                    </mxGeometry>
+                </mxCell>
+                <mxCell id="note" value="Explorationslauf: Modell im Pfad.&#xa;Replay / CI: Schritte aus steps.json,&#xa;Klicks per Template-Matching —&#xa;Ollama samt beider Kanten entfaellt." style="shape=note;whiteSpace=wrap;html=1;size=14;fillColor=#ffffff;strokeColor=#999999;align=left;spacingLeft=8;fontSize=11;" parent="1" vertex="1">
+                    <mxGeometry x="750" y="495" width="260" height="90" as="geometry"/>
+                </mxCell>
+                <mxCell id="5" value="done" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontStyle=1;" vertex="1" parent="1">
+                    <mxGeometry x="80" y="640" width="490" height="55" as="geometry"/>
+                </mxCell>
+            </root>
+        </mxGraphModel>
+    </diagram>
+</mxfile>

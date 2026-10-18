@@ -1,0 +1,36 @@
+name: Geany aus dem Terminal starten und beide Fenster wieder schliessen
+vnc:
+  server: 172.19.0.10::5901
+  password: '123456'
+steps:
+  - type: key
+    name: terminal oeffnen
+    key: ctrl-alt-t
+  - type: type
+    name: kommando tippen
+    text: geany &
+  - type: key
+    name: abschicken
+    key: enter
+  - type: screenshot
+    name: nach_dem_start
+  - type: assert
+    name: geany sichtbar
+    prompt: Ist das Fenster des Texteditors Geany geoeffnet?
+  - type: assert
+    name: test_geany_status_text
+    prompt: Steht im Geany-Fensters die Zeile "This is Geany 2.0"?
+  - type: click_marks
+    name: geany schliessen
+    prompt: der Schliessen-Button (X) in der Titelleiste des Geany-Fensters
+    needle: images/close.png
+  - type: assert
+    name: geany ist zu
+    prompt: Ist das Fenster des Texteditors Geany noch sichtbar?
+    expected: false
+  - type: click_marks
+    name: terminal schliessen
+    prompt: der Schliessen-Button (X) in der Titelleiste des Terminal-Fensters
+    needle: images/close.png
+  - type: screenshot
+    name: am_ende
