@@ -45,7 +45,7 @@ aiguitest-bridge        the package over stdio for the VS Code extension (CLI)
 vscode/                 VS Code extension: command list, live view, recorder
 tests/                  the tests: test_*.py, shared steps in common.py
 images/                 needles (example images), versioned
-doc/                    commands.md, api.md (API reference)
+doc/                    commands.md, api.md (API reference), website.md
 aiguitest-architektur.drawio
                         diagram: components, layers, step flow (by hand)
 archiv/vnc_test.py      first spike, plain VNC without a model

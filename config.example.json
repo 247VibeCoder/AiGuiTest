@@ -3,6 +3,7 @@
   "vlm": {
     "base": "http://ctollama.example.com:11434/v1",
     "model": "qwen3-vl:8b",
-    "key": "none"
+    "key": "none",
+    "verify": true
   }
 }
