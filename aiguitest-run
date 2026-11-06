@@ -1,0 +1,120 @@
+#!/usr/bin/env python3
+"""Test run: the pytest tests under tests/ against the VNC desktop.
+
+    ./start.sh aiguitest-run --selftest              # without VNC/model
+    ./start.sh aiguitest-run                         # every test in tests/
+    ./start.sh aiguitest-run login                   # tests/test_login.py
+    ./start.sh aiguitest-run tests/test_login.py::test_locked -x
+    ./start.sh aiguitest-run login --nollm           # recorded points, no
+                                                     # model for clicks
+    ./start.sh aiguitest-run login --image desk.png --fake-vlm   # offline
+    ./start.sh aiguitest-run --replay runs/<ts>/<test>   # without a model,
+                                                         # by template
+
+Everything else goes to pytest: -k, -x, -v, --junitxml=report.xml, ...
+Every test logs to runs/<ts>/<test>/ (run.json, a screenshot per step,
+error.png); the console output also goes to log/<ts>_<name>.log.
+"""
+
+import argparse
+import os
+import sys
+
+from aiguitest import (PASSWORD, SERVER, TESTS, WORKSPACE, replay, run_log,
+                       selftest, test_path)
+
+# pytest options that take a value - the word after them is not a test
+_VALUE_OPTS = {"-k", "-m", "-p", "-o", "-c", "--rootdir", "--junitxml",
+               "--vnc", "--vnc-password", "--image", "--runs", "--tb",
+               "--maxfail", "--deselect", "--ignore"}
+
+
+def _tests(args):
+    """Bare test names -> files under tests/; [] if none were given."""
+    out, found, skip = [], False, False
+    for a in args:
+        if skip:
+            out.append(a)
+            skip = False
+        elif a in _VALUE_OPTS:
+            out.append(a)
+            skip = True
+        elif a.startswith("-"):
+            out.append(a)
+        else:
+            found = True
+            out.append(a if os.path.exists(a.split("::")[0]) else test_path(a))
+    return out, found
+
+
+def main():
+    p = argparse.ArgumentParser(add_help=False)
+    p.add_argument("--selftest", action="store_true")
+    p.add_argument("--replay", metavar="RUNDIR")
+    p.add_argument("-h", "--help", action="store_true")
+    args, rest = p.parse_known_args()
+
+    if args.help:
+        print(__doc__.strip())
+        print("\nOptions of the aiguitest pytest plugin: --vnc, --vnc-password,"
+              " --nollm, --image, --fake-vlm, --runs - see pytest --help.")
+        return 0
+    if args.selftest:
+        selftest()
+        return 0
+    if args.replay:
+        return _replay(args.replay, rest)
+
+    rest, given = _tests(rest)
+    if not given:
+        rest.append(TESTS)
+    name = "tests"
+    for a in rest:
+        if not a.startswith("-") and a.endswith(".py"):
+            name = os.path.splitext(os.path.basename(a))[0]
+            break
+    with run_log(name) as log:
+        try:
+            import pytest
+        except ImportError:
+            print("pytest missing: .venv/bin/pip install pytest",
+                  file=sys.stderr)
+            return 2
+        argv = ["-p", "aiguitest.pytest_plugin", "--rootdir", WORKSPACE,
+                "--tb", "short"] + rest
+        # Live output: each step prints as it happens instead of pytest
+        # holding it back until a test fails. --capture=... overrides it.
+        if not any(a == "-s" or a.startswith("--capture") for a in rest):
+            argv.insert(0, "-s")
+        try:
+            return int(pytest.main(argv))
+        finally:
+            print("Log: %s" % os.path.relpath(log.path))
+
+
+def _replay(rundir, rest):
+    """Repeat a recorded test run without a model."""
+    q = argparse.ArgumentParser(prog="aiguitest-run --replay")
+    q.add_argument("--vnc", default=SERVER)
+    q.add_argument("--vnc-password", default=PASSWORD)
+    a = q.parse_args(rest)
+    with run_log("replay_" + os.path.basename(os.path.normpath(rundir))):
+        from aiguitest import VncSession
+        try:
+            session = VncSession(a.vnc, a.vnc_password)
+        except Exception as e:
+            print("No VNC connection to %s\n  %s: %s" % (a.vnc, type(e).__name__, e),
+                  file=sys.stderr)
+            return 2
+        try:
+            replay(rundir, session)
+            return 0
+        except AssertionError as e:
+            print("\nFAILED: %s" % e, file=sys.stderr)
+            return 1
+        finally:
+            session.close()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

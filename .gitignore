@@ -1,0 +1,17 @@
+.venv/
+tmp/
+log/
+__pycache__/
+.pytest_cache/
+config.json
+log/
+images/
+tmp/
+runs/
+vscode/node_modules/
+vscode/out/
+*.vsix
+vscode/
+website.md
+AGENTS.md
+CLAUDE.md

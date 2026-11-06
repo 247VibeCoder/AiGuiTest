@@ -1,0 +1,363 @@
+#!/usr/bin/env python3
+"""Editor bridge: the aiguitest API for the VS Code extension, over stdio.
+
+    .venv/bin/python aiguitest-bridge            # started by the extension
+
+One JSON object per line in, one per line out:
+
+    > {"id": 1, "cmd": "connect", "server": "172.19.0.10::5901"}
+    < {"id": 1, "ok": true, "result": {"width": 1024, "height": 768}}
+    > {"id": 2, "cmd": "frame"}
+    < {"id": 2, "ok": true, "result": {"frame": 1, "jpeg": "..."}}
+
+Errors come back as {"ok": false, "error": "<plain text>"}, never as a
+traceback - the extension shows them to the user as they are. Everything
+the package prints (Run, match ...) goes to stderr, which the extension
+shows in its output channel; stdout belongs to the protocol alone.
+
+This is a user interface, not API - so it is a CLI
+next to the package, not part of it. vncdotool can connect only once per
+process (VncSession.close stops its reactor for good), so 'disconnect'
+ends the bridge; the extension starts a new one for the next connection.
+"""
+
+import base64
+import json
+import os
+import re
+import sys
+import time
+import traceback
+
+# stdout is the protocol: keep the real one, send all prints to stderr
+_PROTO = os.fdopen(os.dup(sys.stdout.fileno()), "w", buffering=1)
+sys.stdout = sys.stderr
+
+import cv2  # noqa: E402
+
+from aiguitest import (IMAGE_DIRS, IMAGE_EXT, IMAGES, PASSWORD,  # noqa: E402
+                       PROJECT, SERVER, WORKSPACE, ImageSource, Run, VncSession,
+                       VlmError, candidate_boxes, image_path, parse_target,
+                       resolve_key, send_sequence, tmp_path)
+from aiguitest.points import reference_path  # noqa: E402
+
+VERSION = 2               # protocol; 2: 'commands' instead of 'check'
+_KEEP_FRAMES = 4          # the user may click on a frame that is not the newest
+
+
+class BridgeError(Exception):
+    """A message for the user, sent back as is."""
+
+
+class Bridge:
+
+    def __init__(self):
+        self.session = None
+        self.source = None              # "vnc <server>" or "image <path>"
+        self.frames = {}                # id -> BGR image
+        self.next_frame = 1
+        self._vlm = None
+
+    # ------------------------------------------------------- helpers --
+
+    def _need_session(self):
+        if self.session is None:
+            raise BridgeError("not connected - connect to a VNC server first")
+        return self.session
+
+    def _frame(self, frame_id):
+        """The frame the user looked at; crops must come from that one."""
+        if frame_id is None:
+            return self._grab()[1]
+        img = self.frames.get(int(frame_id))
+        if img is None:
+            raise BridgeError("frame %s is gone - refresh the view" % frame_id)
+        return img
+
+    def _grab(self):
+        img = self._need_session().screenshot()
+        fid = self.next_frame
+        self.next_frame += 1
+        self.frames[fid] = img
+        for old in sorted(self.frames)[:-_KEEP_FRAMES]:
+            del self.frames[old]
+        return fid, img
+
+    def _vlm_client(self):
+        if self._vlm is None:
+            from aiguitest import Vlm
+            self._vlm = Vlm()
+        return self._vlm
+
+    @staticmethod
+    def _box(b, img):
+        h, w = img.shape[:2]
+        x1, y1, x2, y2 = [int(round(float(v))) for v in b]
+        x1, x2 = sorted((max(0, min(x1, w)), max(0, min(x2, w))))
+        y1, y2 = sorted((max(0, min(y1, h)), max(0, min(y2, h))))
+        if x2 - x1 < 4 or y2 - y1 < 4:
+            raise BridgeError("the region is too small (at least 4x4 pixels)")
+        return [x1, y1, x2, y2]
+
+    # ------------------------------------------------------ commands --
+
+    def cmd_hello(self, req):
+        return {"version": VERSION, "project": PROJECT, "workspace": WORKSPACE,
+                "images": IMAGES, "server": SERVER,
+                "connected": self.source}
+
+    def cmd_connect(self, req):
+        """server/password from the request, else config.json / VNC_SERVER -
+        as aiguitest-run. 'image' instead opens a PNG (offline, nothing is
+        sent anywhere)."""
+        if self.session is not None:
+            raise BridgeError("already connected to %s" % self.source)
+        if req.get("image"):
+            self.session = ImageSource(req["image"])
+            self.source = "image %s" % req["image"]
+        else:
+            server = req.get("server") or SERVER
+            password = req.get("password") or PASSWORD
+            try:
+                self.session = VncSession(server, password)
+            except Exception as e:
+                raise BridgeError("no VNC connection to %s: %s: %s"
+                                  % (server, type(e).__name__, e))
+            self.source = "vnc %s" % server
+        _, img = self._grab()
+        h, w = img.shape[:2]
+        return {"source": self.source, "width": w, "height": h}
+
+    def cmd_frame(self, req):
+        fid, img = self._grab()
+        h, w = img.shape[:2]
+        if req.get("png"):
+            ok, buf = cv2.imencode(".png", img)
+            kind = "png"
+        else:
+            quality = int(req.get("quality", 85))
+            ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY,
+                                                 quality])
+            kind = "jpeg"
+        if not ok:
+            raise BridgeError("could not encode the screenshot")
+        return {"frame": fid, "width": w, "height": h, "format": kind,
+                "data": base64.b64encode(buf.tobytes()).decode("ascii")}
+
+    def cmd_act(self, req):
+        """Do something on the desktop: click, double_click, right_click,
+        move_to at x, y."""
+        s = self._need_session()
+        x, y = int(req["x"]), int(req["y"])
+        action = req.get("action", "click")
+        if action == "click":
+            s.click(x, y)
+        elif action == "double_click":
+            s.double_click(x, y)
+        elif action == "right_click":
+            s.right_click(x, y)
+        elif action == "move_to":
+            s.move(x, y)
+        else:
+            raise BridgeError("unknown action: %s" % action)
+        return {"action": action, "point": [x, y]}
+
+    def cmd_key(self, req):
+        k = resolve_key(req["key"])
+        self._need_session().key(k)
+        return {"key": k}
+
+    def cmd_type(self, req):
+        text = req["text"]
+        s = self._need_session()
+        if isinstance(text, list):
+            send_sequence(s, text)
+        else:
+            s.type_text(text)
+        return {"text": text}
+
+    def cmd_probe(self, req):
+        """The smallest candidate box under a point - the suggestion for
+        an image target when the user just clicks instead of dragging."""
+        img = self._frame(req.get("frame"))
+        x, y = int(req["x"]), int(req["y"])
+        hits = [(w * h, (bx, by, bx + w, by + h))
+                for bx, by, w, h in candidate_boxes(img)
+                if bx <= x <= bx + w and by <= y <= by + h]
+        if hits:
+            box = list(min(hits)[1])
+        else:
+            h, w = img.shape[:2]
+            box = [max(0, x - 16), max(0, y - 16), min(w, x + 16),
+                   min(h, y + 16)]
+        return {"box": box, "candidate": bool(hits)}
+
+    def cmd_remember(self, req):
+        """The reference image of a recorded text target: the element
+        under the point (or 'box') as images/points/<text>.png, so the
+        recorded point is checked from the first run on (points.py).
+        Returns the point to write - the centre of what was saved, where
+        a run finds it again."""
+        img = self._frame(req.get("frame"))
+        if req.get("box"):
+            x1, y1, x2, y2 = self._box(req["box"], img)
+        else:
+            x1, y1, x2, y2 = self.cmd_probe(req)["box"]
+        h, w = img.shape[:2]
+        crop = img[max(0, y1 - 4):min(h, y2 + 4), max(0, x1 - 4):min(w, x2 + 4)]
+        path = reference_path(str(req["text"]))
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        if not cv2.imwrite(path, crop):
+            raise BridgeError("could not write %s" % path)
+        return {"path": path, "box": [x1, y1, x2, y2],
+                "point": [(x1 + x2) // 2, (y1 + y2) // 2]}
+
+    def cmd_crop(self, req):
+        """Save a region of a frame as images/<name>.png.
+
+        Also says whether the crop is unique on that frame: match() only
+        knows the global maximum, so a second spot nearly as good means
+        an image target alone may hit the wrong one (the X of two windows).
+        """
+        img = self._frame(req.get("frame"))
+        x1, y1, x2, y2 = self._box(req["box"], img)
+        name = (req.get("name") or "").strip()
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+", name):
+            raise BridgeError("image name '%s': only letters, digits, _ . -"
+                              % name)
+        if not name.lower().endswith(IMAGE_EXT):
+            name += ".png"
+        path = os.path.join(IMAGES, name)
+        if os.path.exists(path) and not req.get("overwrite"):
+            raise BridgeError("exists: %s" % os.path.relpath(path, WORKSPACE))
+        crop = img[y1:y2, x1:x2]
+        os.makedirs(IMAGES, exist_ok=True)
+        if not cv2.imwrite(path, crop):
+            raise BridgeError("could not write %s" % path)
+        best, second = _uniqueness(img, crop)
+        return {"path": path, "name": os.path.splitext(name)[0],
+                "file": name, "box": [x1, y1, x2, y2],
+                "score": round(best, 3), "second": round(second, 3),
+                "unique": second < 0.9}
+
+    def cmd_find(self, req):
+        """Try a target on a frame - an image name, 'text:...', a dict.
+        Text targets ask the model; that can take a while."""
+        img = self._frame(req.get("frame"))
+        try:
+            spec = parse_target(req["target"])
+        except SystemExit as e:
+            raise BridgeError(str(e.code))
+        if "text" in spec:
+            run = Run(None, self._vlm_client(), tmp_path("vscode"))
+        else:
+            run = Run(None, None, tmp_path("vscode"))
+        t0 = time.time()
+        try:
+            hit = run._find_once(img, spec)
+        except AssertionError as e:
+            raise BridgeError(str(e))
+        found = bool(hit and "point" in hit)
+        return {"found": found, "point": hit.get("point") if found else None,
+                "box": hit.get("box") if found else None,
+                "why": (hit or {}).get("why", "") if not found else "",
+                "seconds": round(time.time() - t0, 1)}
+
+    def cmd_ask(self, req):
+        """The model's yes/no on a frame - to try an assert before writing it."""
+        img = self._frame(req.get("frame"))
+        return self._vlm_client().ask(img, req["question"])
+
+    def cmd_commands(self, req):
+        """The test commands for the editor's list: name, group,
+        signature, first doc line and a snippet to insert."""
+        from aiguitest.commands import command_list
+        return {"commands": command_list()}
+
+    def cmd_images(self, req):
+        """images: the files in the workspace's images/ (where crops go).
+        found: every name a test can use, as image_path() resolves it -
+        the workspace first, then the tool's images/ (a submodule)."""
+        out = []
+        if os.path.isdir(IMAGES):
+            out = sorted(f for f in os.listdir(IMAGES)
+                         if f.lower().endswith(IMAGE_EXT))
+        found, seen = [], set()
+        for d in IMAGE_DIRS:
+            for f in sorted(os.listdir(d)):
+                name = os.path.splitext(f)[0]
+                p = os.path.join(d, f)
+                if (f.lower().endswith(IMAGE_EXT) and os.path.isfile(p)
+                        and name not in seen):
+                    seen.add(name)
+                    found.append({"name": name, "file": f, "path": p})
+        return {"images": out, "dir": IMAGES, "found": found}
+
+    def cmd_resolve_image(self, req):
+        return {"path": image_path(req["name"])}
+
+    def cmd_disconnect(self, req):
+        raise SystemExit(0)     # see the module docstring
+
+
+# ------------------------------------------------------------- Helpers --
+
+def _uniqueness(img, crop):
+    """(best score, second best score elsewhere) of a crop on its frame."""
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    res = cv2.matchTemplate(gray, cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY),
+                            cv2.TM_CCOEFF_NORMED)
+    _, best, _, (bx, by) = cv2.minMaxLoc(res)
+    h, w = crop.shape[:2]
+    # blank out the best hit and its overlap, then look again
+    res[max(0, by - h // 2):by + h // 2 + 1,
+        max(0, bx - w // 2):bx + w // 2 + 1] = -1
+    _, second, _, _ = cv2.minMaxLoc(res)
+    return float(best), float(second)
+
+
+# ----------------------------------------------------------------- Main --
+
+def _send(obj):
+    _PROTO.write(json.dumps(obj, ensure_ascii=False) + "\n")
+    _PROTO.flush()
+
+
+def main():
+    bridge = Bridge()
+    _send({"id": 0, "ok": True, "result": bridge.cmd_hello({})})
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        rid = None
+        try:
+            req = json.loads(line)
+            rid = req.get("id")
+            fn = getattr(bridge, "cmd_%s" % req.get("cmd"), None)
+            if fn is None:
+                raise BridgeError("unknown command: %s" % req.get("cmd"))
+            _send({"id": rid, "ok": True, "result": fn(req)})
+        except SystemExit:
+            _send({"id": rid, "ok": True, "result": {"bye": True}})
+            break
+        except (BridgeError, VlmError) as e:
+            # VlmError already is a plain-text report (endpoint, proxy, probe)
+            _send({"id": rid, "ok": False, "error": str(e)})
+        except KeyError as e:
+            _send({"id": rid, "ok": False, "error": "missing field %s" % e})
+        except Exception as e:
+            traceback.print_exc()
+            _send({"id": rid, "ok": False,
+                   "error": "%s: %s" % (type(e).__name__, e)})
+    if bridge.session is not None:
+        try:
+            bridge.session.close()
+        except Exception:
+            pass
+    # vncdotool's reactor thread would keep the process alive
+    os._exit(0)
+
+
+if __name__ == "__main__":
+    main()
